@@ -41,7 +41,7 @@ import {
   getElementHistory as dbGetElementHistory, getProjectHistory as dbGetProjectHistory,
   ensureTenant as dbEnsureTenant, setActiveTenant as dbSetActiveTenant,
   getActiveTenant as dbGetActiveTenant, getActiveTenantId as dbGetActiveTenantId,
-  listTenants as dbListTenants
+  listTenants as dbListTenants, createTenant as dbCreateTenant, renameTenant as dbRenameTenant
 } from './db.js';
 
 // Load environment variables
@@ -1004,6 +1004,38 @@ const tools: Tool[] = [
         }
       },
       required: ['tenantId']
+    }
+  },
+  {
+    name: 'create_tenant',
+    description: 'Create a new named workspace (tenant) and switch to it.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        name: {
+          type: 'string',
+          description: 'Human-readable name for the new workspace'
+        }
+      },
+      required: ['name']
+    }
+  },
+  {
+    name: 'rename_tenant',
+    description: 'Rename an existing workspace. Omit tenantId to rename the currently active workspace.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        name: {
+          type: 'string',
+          description: 'New name for the workspace'
+        },
+        tenantId: {
+          type: 'string',
+          description: 'ID of the tenant to rename (defaults to active tenant)'
+        }
+      },
+      required: ['name']
     }
   }
 ];
@@ -2743,6 +2775,53 @@ server.setRequestHandler(CallToolRequestSchema, async (request: CallToolRequest)
           content: [{
             type: 'text',
             text: `Switched to tenant "${tenant.name}" (${tenant.id})\nWorkspace: ${tenant.workspace_path}\nActive project: ${activeProject.name} (${activeProject.id})`
+          }]
+        };
+      }
+
+      case 'create_tenant': {
+        const params = z.object({ name: z.string() }).parse(args);
+        logger.info('Creating tenant via MCP', { name: params.name });
+
+        const newTenant = dbCreateTenant(params.name);
+        dbSetActiveTenant(newTenant.id);
+        const activeProject = dbGetActiveProject();
+
+        try {
+          await fetch(`${EXPRESS_SERVER_URL}/api/tenants`, {
+            method: 'POST',
+            headers: { ...canvasHeaders(), 'Content-Type': 'application/json' },
+            body: JSON.stringify({ name: params.name, id: newTenant.id })
+          });
+        } catch {}
+
+        return {
+          content: [{
+            type: 'text',
+            text: `Created and switched to workspace "${newTenant.name}" (${newTenant.id})\nActive project: ${activeProject.name} (${activeProject.id})`
+          }]
+        };
+      }
+
+      case 'rename_tenant': {
+        const params = z.object({ name: z.string(), tenantId: z.string().optional() }).parse(args);
+        const targetId = params.tenantId ?? dbGetActiveTenant().id;
+        logger.info('Renaming tenant via MCP', { tenantId: targetId, name: params.name });
+
+        const renamed = dbRenameTenant(targetId, params.name);
+
+        try {
+          await fetch(`${EXPRESS_SERVER_URL}/api/tenants/${targetId}/rename`, {
+            method: 'PUT',
+            headers: { ...canvasHeaders(), 'Content-Type': 'application/json' },
+            body: JSON.stringify({ name: params.name })
+          });
+        } catch {}
+
+        return {
+          content: [{
+            type: 'text',
+            text: `Renamed workspace to "${renamed.name}" (${targetId})`
           }]
         };
       }

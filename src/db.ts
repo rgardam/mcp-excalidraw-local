@@ -520,6 +520,23 @@ export function listTenants(): Tenant[] {
   return db.prepare('SELECT * FROM tenants ORDER BY last_accessed_at DESC').all() as Tenant[];
 }
 
+export function createTenant(name: string, workspacePath?: string): Tenant {
+  const id = `tenant-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  const now = new Date().toISOString();
+  const path = workspacePath || id;
+  db.prepare(
+    'INSERT INTO tenants (id, name, workspace_path, created_at, last_accessed_at) VALUES (?, ?, ?, ?, ?)'
+  ).run(id, name, path, now, now);
+  return { id, name, workspace_path: path, created_at: now, last_accessed_at: now };
+}
+
+export function renameTenant(id: string, name: string): Tenant {
+  const existing = db.prepare('SELECT * FROM tenants WHERE id = ?').get(id) as Tenant | undefined;
+  if (!existing) throw new Error(`Tenant "${id}" not found`);
+  db.prepare('UPDATE tenants SET name = ? WHERE id = ?').run(name, id);
+  return { ...existing, name };
+}
+
 // ── Projects ──
 
 export function createProject(name: string, description?: string): Project {

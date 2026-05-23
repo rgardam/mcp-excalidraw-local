@@ -48,7 +48,7 @@ Click the workspace badge to switch between isolated canvases — each workspace
 - [Environment Variables](#environment-variables)
 - [Multi-Tenancy (Workspaces)](#multi-tenancy-workspaces)
 - [Agent Skill (Optional)](#agent-skill-optional)
-- [MCP Tools (32 Total)](#mcp-tools-32-total)
+- [MCP Tools (34 Total)](#mcp-tools-34-total)
 - [Testing](#testing)
 - [Troubleshooting](#troubleshooting)
 - [Known Issues / TODO](#known-issues--todo)
@@ -458,8 +458,18 @@ Each workspace (codebase) gets an isolated canvas. The tenant is identified by a
 
 1. **Auto-detection**: When the MCP starts, it calls `server.listRoots()` to get the actual workspace path from the MCP client. This is hashed to create a unique tenant ID.
 2. **Per-request scoping**: Every HTTP request includes an `X-Tenant-Id` header. The canvas server uses this to scope all CRUD operations to the correct tenant.
-3. **UI switcher**: The canvas UI shows a "Workspace: &lt;name&gt;" badge. Click it to open a dropdown with all known workspaces, complete with search.
+3. **UI switcher**: The canvas UI shows a "Workspace: &lt;name&gt;" badge. Click it to open a dropdown with all known workspaces, complete with search. Use the **+ New Workspace** button to create a named workspace from the browser.
 4. **Multi-instance safe**: SQLite WAL mode with `busy_timeout = 5000ms` handles concurrent access from multiple client instances.
+5. **Auto-create on switch**: If the canvas server receives a `PUT /api/tenant/active` for an unknown tenant ID (e.g. from an MCP instance that manages its own tenant registry), the tenant is created automatically rather than returning a foreign key error.
+
+### Managing workspaces via MCP
+
+| Tool | Description |
+|---|---|
+| `list_tenants` | List all workspaces with their IDs and last-accessed time |
+| `switch_tenant` | Switch to an existing workspace by ID |
+| `create_tenant` | Create a new named workspace and switch to it immediately |
+| `rename_tenant` | Rename any workspace; defaults to the currently active one |
 
 ### Projects within a tenant
 
@@ -470,7 +480,7 @@ Each tenant can have multiple projects (collections of elements). Use the `list_
 This repo includes a skill at `skills/excalidraw-skill/` that provides:
 
 - **Workflow playbook** (`SKILL.md`): step-by-step guidance for drawing, refining, and exporting diagrams — including an iterative write-check-review cycle, sizing rules, color palettes, and anti-patterns
-- **Cheatsheet** (`references/cheatsheet.md`): MCP tool and REST API reference for all 32 tools
+- **Cheatsheet** (`references/cheatsheet.md`): MCP tool and REST API reference for all 34 tools
 - **Helper scripts** (`scripts/*.cjs`): export, import, clear, healthcheck, CRUD operations
 
 ### Install via Setup Wizard
@@ -498,7 +508,7 @@ cp -R skills/excalidraw-skill ~/.claude/skills/excalidraw-skill
 cp -R skills/excalidraw-skill ~/.codex/skills/excalidraw-skill
 ```
 
-## MCP Tools (32 Total)
+## MCP Tools (34 Total)
 
 | Category | Tools |
 |---|---|
@@ -511,7 +521,7 @@ cp -R skills/excalidraw-skill ~/.codex/skills/excalidraw-skill
 | **Design Guide** | `read_diagram_guide` |
 | **Resources** | `get_resource` |
 | **Search & History** | `search_elements`, `element_history` |
-| **Multi-Tenancy** | `list_tenants`, `switch_tenant` |
+| **Multi-Tenancy** | `list_tenants`, `switch_tenant`, `create_tenant`, `rename_tenant` |
 | **Projects** | `list_projects`, `switch_project` |
 
 Full schemas are discoverable via `tools/list` or in `skills/excalidraw-skill/references/cheatsheet.md`.

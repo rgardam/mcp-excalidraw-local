@@ -27,7 +27,7 @@ import {
   BroadcastResult
 } from './types.js';
 import * as store from './db.js';
-import { initDb, listTenants as dbListTenants, getActiveTenant as dbGetActiveTenant, setActiveTenant as dbSetActiveTenant, getDefaultProjectForTenant, getCurrentSyncVersion, getChangesSince } from './db.js';
+import { initDb, listTenants as dbListTenants, getActiveTenant as dbGetActiveTenant, setActiveTenant as dbSetActiveTenant, getDefaultProjectForTenant, getCurrentSyncVersion, getChangesSince, ensureTenant as dbEnsureTenant, renameTenant as dbRenameTenant } from './db.js';
 import { z } from 'zod';
 import WebSocket from 'ws';
 
@@ -1437,6 +1437,35 @@ app.get('/api/tenants', (req: Request, res: Response) => {
   }
 });
 
+app.post('/api/tenants', (req: Request, res: Response) => {
+  try {
+    const { name, id } = req.body;
+    if (!name || typeof name !== 'string' || !name.trim()) {
+      return res.status(400).json({ success: false, error: 'name is required' });
+    }
+    const tenantId = id || `tenant-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    const tenant = dbEnsureTenant(tenantId, name.trim(), name.trim());
+    res.json({ success: true, tenant });
+  } catch (error) {
+    logger.error('Error creating tenant:', error);
+    res.status(500).json({ success: false, error: (error as Error).message });
+  }
+});
+
+app.put('/api/tenants/:id/rename', (req: Request, res: Response) => {
+  try {
+    const { name } = req.body;
+    if (!name || typeof name !== 'string' || !name.trim()) {
+      return res.status(400).json({ success: false, error: 'name is required' });
+    }
+    const tenant = dbRenameTenant(req.params.id as string, name.trim());
+    res.json({ success: true, tenant });
+  } catch (error) {
+    logger.error('Error renaming tenant:', error);
+    res.status(500).json({ success: false, error: (error as Error).message });
+  }
+});
+
 app.get('/api/tenant/active', (req: Request, res: Response) => {
   try {
     const tenant = dbGetActiveTenant();
@@ -1454,6 +1483,8 @@ app.put('/api/tenant/active', (req: Request, res: Response) => {
       return res.status(400).json({ success: false, error: 'tenantId is required' });
     }
 
+    // Auto-create if unknown (MCP server manages its own tenant registry)
+    dbEnsureTenant(tenantId, tenantId, tenantId);
     dbSetActiveTenant(tenantId);
     const tenant = dbGetActiveTenant();
 
