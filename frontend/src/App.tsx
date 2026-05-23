@@ -68,6 +68,7 @@ function App(): JSX.Element {
   const isSyncingRef = useRef<boolean>(false)
   const debounceTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const lastSyncedHashRef = useRef<string>('')
+  const isDirtyRef = useRef<boolean>(false)
   const lastSyncVersionRef = useRef<number>(
     parseInt(localStorage.getItem('excalidraw-last-sync-version') ?? '0', 10)
   )
@@ -75,7 +76,7 @@ function App(): JSX.Element {
   const lastReceivedSyncVersionRef = useRef<number>(0)
   const isResyncingRef = useRef<boolean>(false)
 
-  const DEBOUNCE_MS = 3000
+  const DEBOUNCE_MS = 1500
 
   // Tenant state
   const [activeTenant, setActiveTenant] = useState<TenantInfo | null>(null)
@@ -118,13 +119,59 @@ function App(): JSX.Element {
   useEffect(() => {
     if (excalidrawAPI) {
       loadExistingElements()
-      
+
       // Ensure WebSocket is connected for real-time updates
       if (!isConnected) {
         connectWebSocket()
       }
     }
   }, [excalidrawAPI, isConnected])
+
+  // Guard: suppress onLibraryChange saves until we've loaded from the backend,
+  // preventing Excalidraw's empty-localStorage init from overwriting saved data.
+  const libraryLoadedRef = useRef<boolean>(false)
+
+  // Load persisted library from backend, then handle any #addLibrary= URL hash
+  useEffect(() => {
+    if (!excalidrawAPI) return
+
+    const loadAndHandleHash = async () => {
+      // 1. Restore saved library from backend first
+      try {
+        const res = await fetch('/api/settings/excalidraw-library')
+        const data = await res.json()
+        if (data.success && data.value) {
+          const items = JSON.parse(data.value)
+          if (Array.isArray(items) && items.length > 0) {
+            await excalidrawAPI.updateLibrary({ libraryItems: items, merge: false })
+          }
+        }
+      } catch {}
+
+      libraryLoadedRef.current = true
+
+      // 2. Handle #addLibrary= hash from libraries.excalidraw.com redirects
+      const hash = window.location.hash
+      const match = hash.match(/[#&]addLibrary=([^&]+)/)
+      if (match) {
+        try {
+          const libUrl = decodeURIComponent(match[1])
+          const libRes = await fetch(libUrl)
+          const libData = await libRes.json()
+          const newItems = libData.libraryItems ?? libData.library ?? libData
+          if (Array.isArray(newItems) && newItems.length > 0) {
+            await excalidrawAPI.updateLibrary({ libraryItems: newItems, merge: true })
+          }
+          // Remove hash from URL without triggering a reload
+          history.replaceState(null, '', window.location.pathname + window.location.search)
+        } catch (e) {
+          console.error('Failed to load library from URL:', e)
+        }
+      }
+    }
+
+    loadAndHandleHash()
+  }, [excalidrawAPI])
 
   // Persist auto-save preference and cancel pending timer when toggled off
   const toggleAutoSave = () => {
@@ -151,6 +198,8 @@ function App(): JSX.Element {
   const handleCanvasChange = (): void => {
     if (!autoSave) return
 
+    isDirtyRef.current = true
+
     if (debounceTimerRef.current) clearTimeout(debounceTimerRef.current)
 
     debounceTimerRef.current = setTimeout(() => {
@@ -158,11 +207,39 @@ function App(): JSX.Element {
 
       const elements = excalidrawAPI.getSceneElements()
       const hash = computeElementHash(elements)
-      if (hash === lastSyncedHashRef.current) return
+      if (hash === lastSyncedHashRef.current) {
+        isDirtyRef.current = false
+        return
+      }
 
+      isDirtyRef.current = false
       syncToBackend()
     }, DEBOUNCE_MS)
   }
+
+  // Periodic fallback: syncs every 10s if dirty (catches debounce-reset loops from WS traffic)
+  useEffect(() => {
+    const interval = setInterval(() => {
+      if (!isDirtyRef.current || !excalidrawAPI || isSyncingRef.current || !autoSave) return
+      const elements = excalidrawAPI.getSceneElements()
+      const hash = computeElementHash(elements)
+      if (hash === lastSyncedHashRef.current) { isDirtyRef.current = false; return }
+      isDirtyRef.current = false
+      syncToBackend()
+    }, 10000)
+    return () => clearInterval(interval)
+  }, [excalidrawAPI, autoSave])
+
+  // Sync when tab loses focus (catches refresh-before-debounce-fires)
+  useEffect(() => {
+    const onVisibilityChange = () => {
+      if (document.visibilityState === 'hidden' && isDirtyRef.current && excalidrawAPI && !isSyncingRef.current) {
+        syncToBackend()
+      }
+    }
+    document.addEventListener('visibilitychange', onVisibilityChange)
+    return () => document.removeEventListener('visibilitychange', onVisibilityChange)
+  }, [excalidrawAPI])
 
   const convertElementsPreservingImageProps = (
     cleanedElements: any[]
@@ -325,12 +402,17 @@ function App(): JSX.Element {
             } else if (sc.element) {
               const cleaned = cleanElementForExcalidraw(sc.element)
               const converted = convertToExcalidrawElements([cleaned], { regenerateIds: false })
-              const idx = merged.findIndex(el => el.id === sc.id)
-              if (idx >= 0) {
-                merged[idx] = converted[0]!
-              } else {
-                merged.push(...converted)
+              // Remove old element + any bound text children before re-inserting
+              const old = merged.find(el => el.id === sc.id)
+              if (old) {
+                const boundIds = new Set<string>(
+                  ((old as any).boundElements || [])
+                    .filter((b: any) => b.type === 'text')
+                    .map((b: any) => b.id as string)
+                )
+                merged = merged.filter(el => el.id !== sc.id && !boundIds.has(el.id))
               }
+              merged.push(...converted)
             }
           }
           api.updateScene({ elements: merged, captureUpdate: CaptureUpdateAction.NEVER })
@@ -425,12 +507,19 @@ function App(): JSX.Element {
         case 'element_updated':
           if (data.element) {
             const cleanedUpdatedElement = cleanElementForExcalidraw(data.element)
-            const convertedUpdatedElement = convertToExcalidrawElements([cleanedUpdatedElement], { regenerateIds: false })[0]
-            const updatedElements = currentElements.map(el =>
-              el.id === data.element!.id ? convertedUpdatedElement : el
+            const converted = convertToExcalidrawElements([cleanedUpdatedElement], { regenerateIds: false })
+            // Remove old element + its bound text children, then add all converted elements
+            const oldUpdated = currentElements.find(el => el.id === data.element!.id)
+            const boundUpdatedIds = new Set<string>(
+              oldUpdated ? ((oldUpdated as any).boundElements || [])
+                .filter((b: any) => b.type === 'text')
+                .map((b: any) => b.id as string) : []
+            )
+            const filtered = currentElements.filter(el =>
+              el.id !== data.element!.id && !boundUpdatedIds.has(el.id)
             )
             api.updateScene({
-              elements: updatedElements,
+              elements: [...filtered, ...converted],
               captureUpdate: CaptureUpdateAction.NEVER
             })
             sendAck(data.msgId, 'applied', 1, 1)
@@ -955,12 +1044,17 @@ function App(): JSX.Element {
               } else if (sc.element) {
                 const cleaned = cleanElementForExcalidraw(sc.element)
                 const converted = convertToExcalidrawElements([cleaned], { regenerateIds: false })
-                const idx = merged.findIndex(el => el.id === sc.id)
-                if (idx >= 0) {
-                  merged[idx] = converted[0]!
-                } else {
-                  merged.push(...converted)
+                // Remove old element + any bound text children before re-inserting
+                const old = merged.find(el => el.id === sc.id)
+                if (old) {
+                  const boundIds = new Set<string>(
+                    ((old as any).boundElements || [])
+                      .filter((b: any) => b.type === 'text')
+                      .map((b: any) => b.id as string)
+                  )
+                  merged = merged.filter(el => el.id !== sc.id && !boundIds.has(el.id))
                 }
+                merged.push(...converted)
               }
             }
             api.updateScene({ elements: merged, captureUpdate: CaptureUpdateAction.NEVER })
@@ -986,6 +1080,31 @@ function App(): JSX.Element {
       console.error('Sync error:', error)
     } finally {
       isSyncingRef.current = false
+    }
+  }
+
+  // New workspace modal state
+  const [showNewWorkspace, setShowNewWorkspace] = useState(false)
+  const [newWorkspaceName, setNewWorkspaceName] = useState('')
+  const newWorkspaceInputRef = useRef<HTMLInputElement | null>(null)
+
+  const createWorkspace = async () => {
+    const name = newWorkspaceName.trim()
+    if (!name) return
+    try {
+      const res = await fetch('/api/tenants', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name })
+      })
+      const data = await res.json()
+      if (!data.success) { showToast('Failed to create workspace', 3000); return }
+      setShowNewWorkspace(false)
+      setNewWorkspaceName('')
+      await fetchTenants()
+      await switchTenant(data.tenant.id)
+    } catch {
+      showToast('Failed to create workspace', 3000)
     }
   }
 
@@ -1148,10 +1267,48 @@ function App(): JSX.Element {
                 ))}
                 {filtered.length === 0 && <div className="menu-empty">No matching workspaces</div>}
               </div>
+              <div style={{ padding: '8px', borderTop: '1px solid #f0f0f0' }}>
+                <button
+                  className="menu-item"
+                  style={{ width: '100%', color: '#4caf50', fontWeight: 600 }}
+                  onClick={() => {
+                    setMenuOpen(false)
+                    setNewWorkspaceName('')
+                    setShowNewWorkspace(true)
+                    setTimeout(() => newWorkspaceInputRef.current?.focus(), 80)
+                  }}
+                >
+                  + New Workspace
+                </button>
+              </div>
             </div>
           </div>
         )
       })()}
+
+      {showNewWorkspace && (
+        <div className="menu-overlay" onClick={() => setShowNewWorkspace(false)}>
+          <div className="confirm-dialog" onClick={e => e.stopPropagation()}>
+            <div className="confirm-title">New Workspace</div>
+            <p className="confirm-msg">Enter a name for your new workspace.</p>
+            <div className="form-group" style={{ marginBottom: '20px' }}>
+              <input
+                ref={newWorkspaceInputRef}
+                type="text"
+                placeholder="Workspace name"
+                value={newWorkspaceName}
+                onChange={e => setNewWorkspaceName(e.target.value)}
+                onKeyDown={e => { if (e.key === 'Enter') createWorkspace(); if (e.key === 'Escape') setShowNewWorkspace(false) }}
+                style={{ width: '100%', boxSizing: 'border-box' }}
+              />
+            </div>
+            <div className="confirm-actions">
+              <button className="btn-secondary" onClick={() => setShowNewWorkspace(false)}>Cancel</button>
+              <button className="btn-success" onClick={createWorkspace} disabled={!newWorkspaceName.trim()}>Create</button>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* Clear canvas confirmation modal (UI button only) */}
       {showClearConfirm && (
@@ -1187,6 +1344,14 @@ function App(): JSX.Element {
             }
           }}
           onChange={handleCanvasChange}
+          onLibraryChange={(items) => {
+            if (!libraryLoadedRef.current) return
+            fetch('/api/settings/excalidraw-library', {
+              method: 'PUT',
+              headers: tenantHeaders(),
+              body: JSON.stringify({ value: JSON.stringify(items) })
+            }).catch(() => {})
+          }}
         />
       </div>
     </div>
