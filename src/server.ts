@@ -56,6 +56,8 @@ app.use(express.static(path.join(__dirname, '../dist/frontend')));
 function resolveTenantProject(req: Request): string | undefined {
   const tenantId = req.headers['x-tenant-id'] as string | undefined;
   if (!tenantId) return undefined;
+  // Auto-create tenant if unknown (MCP manages its own registry; canvas must accept any ID)
+  dbEnsureTenant(tenantId, tenantId, tenantId);
   return getDefaultProjectForTenant(tenantId);
 }
 
@@ -64,6 +66,7 @@ function resolveTenantProject(req: Request): string | undefined {
 function resolveScope(req: Request): { tenantId: string; projectId: string } {
   const headerTenantId = req.headers['x-tenant-id'] as string | undefined;
   if (headerTenantId) {
+    dbEnsureTenant(headerTenantId, headerTenantId, headerTenantId);
     const projectId = getDefaultProjectForTenant(headerTenantId) ?? `${headerTenantId}-default`;
     return { tenantId: headerTenantId, projectId };
   }
