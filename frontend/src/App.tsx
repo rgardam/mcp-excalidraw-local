@@ -579,6 +579,14 @@ function App(): JSX.Element {
             elements: [],
             captureUpdate: CaptureUpdateAction.NEVER
           })
+          // Reset sync baseline so auto-sync doesn't re-delete restored elements
+          lastSyncedElementsRef.current = new Map()
+          lastSyncedHashRef.current = ''
+          isDirtyRef.current = false
+          if (debounceTimerRef.current) {
+            clearTimeout(debounceTimerRef.current)
+            debounceTimerRef.current = null
+          }
           sendAck(data.msgId, 'applied')
           break
 
