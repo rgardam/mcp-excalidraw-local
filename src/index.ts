@@ -41,7 +41,8 @@ import {
   getElementHistory as dbGetElementHistory, getProjectHistory as dbGetProjectHistory,
   ensureTenant as dbEnsureTenant, setActiveTenant as dbSetActiveTenant,
   getActiveTenant as dbGetActiveTenant, getActiveTenantId as dbGetActiveTenantId,
-  listTenants as dbListTenants, createTenant as dbCreateTenant, renameTenant as dbRenameTenant
+  listTenants as dbListTenants, createTenant as dbCreateTenant, renameTenant as dbRenameTenant,
+  upsertTenantIfNew as dbUpsertTenantIfNew, Tenant as DbTenant
 } from './db.js';
 
 // Load environment variables
@@ -227,6 +228,30 @@ async function syncToCanvas(operation: string, data: any): Promise<SyncResponse 
     // API error — propagate the actual error message
     logger.warn(`Canvas API error for ${operation}:`, err.message);
     throw error;
+  }
+}
+
+// Fetch all tenants from the canvas server and insert any unknown ones into the local DB.
+// Uses INSERT OR IGNORE so locally renamed tenants are never overwritten.
+async function syncTenantsFromCanvas(): Promise<void> {
+  try {
+    const res = await fetch(`${EXPRESS_SERVER_URL}/api/tenants`, {
+      headers: { 'Content-Type': 'application/json' }
+    });
+    if (!res.ok) {
+      logger.warn(`syncTenantsFromCanvas: canvas returned HTTP ${res.status}`);
+      return;
+    }
+    const data = await res.json() as { success?: boolean; tenants?: DbTenant[] };
+    if (!Array.isArray(data.tenants)) return;
+    let added = 0;
+    for (const t of data.tenants) {
+      dbUpsertTenantIfNew(t);
+      added++;
+    }
+    logger.info(`syncTenantsFromCanvas: synced ${added} tenant(s) from canvas server`);
+  } catch (err) {
+    logger.warn('syncTenantsFromCanvas failed (canvas may not be up yet):', (err as Error).message);
   }
 }
 
@@ -2745,6 +2770,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request: CallToolRequest)
 
       case 'list_tenants': {
         logger.info('Listing tenants via MCP');
+        await syncTenantsFromCanvas();
         const tenants = dbListTenants();
         const activeTenant = dbGetActiveTenant();
         return {
@@ -2873,6 +2899,10 @@ async function runServer(): Promise<void> {
       logger.warn('Canvas server failed to start:', (canvasError as Error).message);
       logger.warn('MCP tools will work without real-time canvas sync');
     }
+
+    // Populate the local tenant registry from the canvas server so that all
+    // workspaces created via the browser are immediately available to switch_tenant.
+    await syncTenantsFromCanvas();
 
     const transport = new StdioServerTransport();
     logger.debug('Connecting to stdio transport...');

@@ -537,6 +537,15 @@ export function renameTenant(id: string, name: string): Tenant {
   return { ...existing, name };
 }
 
+// Insert a tenant from the remote canvas server without overwriting any locally-managed fields
+// (name, workspace_path). If the tenant already exists locally, this is a no-op.
+export function upsertTenantIfNew(tenant: Tenant): void {
+  db.prepare(`
+    INSERT OR IGNORE INTO tenants (id, name, workspace_path, created_at, last_accessed_at)
+    VALUES (?, ?, ?, ?, ?)
+  `).run(tenant.id, tenant.name, tenant.workspace_path, tenant.created_at, tenant.last_accessed_at);
+}
+
 // ── Projects ──
 
 export function createProject(name: string, description?: string): Project {
