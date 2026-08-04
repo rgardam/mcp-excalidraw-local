@@ -18,18 +18,13 @@ RUN npm run build:server
 # Stage 2: Production MCP Server
 FROM node:20-slim AS production
 
-RUN apt-get update && apt-get install -y python3 make g++ && rm -rf /var/lib/apt/lists/*
-
 RUN addgroup --system --gid 1001 nodejs && \
     adduser --system --uid 1001 --gid 1001 nodejs
 
 WORKDIR /app
 
 COPY package*.json ./
-RUN --mount=type=cache,target=/root/.npm npm ci --omit=dev
-
-# Remove build tools after native modules are compiled
-RUN apt-get purge -y python3 make g++ && apt-get autoremove -y
+RUN npm ci --omit=dev --ignore-scripts
 
 COPY --from=builder /app/dist ./dist
 
