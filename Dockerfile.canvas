@@ -36,10 +36,14 @@ RUN addgroup --system --gid 1001 nodejs && \
 WORKDIR /app
 
 COPY package*.json ./
+# Install production dependencies without scripts first
 RUN npm ci --omit=dev --ignore-scripts
 
+# Copy compiled TypeScript and frontend assets
 COPY --from=backend-builder /app/dist ./dist
 COPY --from=frontend-builder /app/dist/frontend ./dist/frontend
+# Copy only the native modules that were compiled with proper build tools
+COPY --from=backend-builder /app/node_modules/better-sqlite3 ./node_modules/better-sqlite3
 
 RUN mkdir -p /app/data && chown -R nodejs:nodejs /app
 USER nodejs
