@@ -1,0 +1,14 @@
+{
+  "name": "excalidraw",
+  "version": "0.1.0",
+  "description": "Claude Code integration for the local Excalidraw MCP server: auto-registers the server, adds diagram-drawing guidance, and diagnoses common setup issues (stale builds, tenant mismatches, destructive auto-sync).",
+  "keywords": ["excalidraw", "diagram", "mcp", "canvas"],
+  "skills": "./skills",
+  "hooks": "./hooks/hooks.json",
+  "mcpServers": {
+    "excalidraw": {
+      "command": "node",
+      "args": ["${CLAUDE_PLUGIN_ROOT}/dist/index.js"]
+    }
+  }
+}
