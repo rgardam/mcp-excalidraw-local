@@ -64,22 +64,50 @@ failure mode was caused by a stale public Docker Hub image during testing.
 
 ## Step 4 — Mass-deletion heuristic
 
+A burst alone isn't enough — a legitimate `clear_canvas` call also produces
+5+ delete rows in a tight window. Cross-reference the server's log (which
+records `Canvas cleared: N elements removed` for every legitimate clear) to
+rule that out before flagging.
+
 ```bash
 cd /Users/gardamr/Documents/git/mcp-excalidraw-local
-DB_PATH="${EXCALIDRAW_DB_PATH:-$HOME/.excalidraw-mcp/excalidraw.db}"
+export DB_PATH="${EXCALIDRAW_DB_PATH:-$HOME/.excalidraw-mcp/excalidraw.db}"
+export LOG_PATH="${LOG_FILE_PATH:-excalidraw.log}"
 node -e "
+const fs = require('fs');
 const Database = require('better-sqlite3');
-const db = new Database('$DB_PATH', { readonly: true });
+const dbPath = process.env.DB_PATH;
+const logPath = process.env.LOG_PATH;
+const db = new Database(dbPath, { readonly: true });
 const rows = db.prepare(\"SELECT created_at FROM element_versions WHERE operation = 'delete' ORDER BY created_at\").all();
 const timestamps = rows.map(r => new Date(r.created_at).getTime());
-let burstFound = null;
+let burst = null;
 for (let i = 0; i + 4 < timestamps.length; i++) {
   if (timestamps[i + 4] - timestamps[i] <= 10000) {
-    burstFound = rows[i].created_at;
+    burst = { start: timestamps[i], end: timestamps[i + 4], startStr: rows[i].created_at };
     break;
   }
 }
-console.log(burstFound ? \`POSSIBLE AUTO-SYNC WIPE at \${burstFound}\` : 'No mass-deletion burst detected');
+if (!burst) {
+  console.log('No mass-deletion burst detected');
+} else {
+  let clearedNearby = false;
+  try {
+    const log = fs.readFileSync(logPath, 'utf8');
+    for (const line of log.split('\n')) {
+      if (!line.includes('Canvas cleared')) continue;
+      const m = line.match(/^(\S+ \S+)/);
+      if (!m) continue;
+      const t = new Date(m[1]).getTime();
+      if (t >= burst.start - 5000 && t <= burst.end + 5000) { clearedNearby = true; break; }
+    }
+  } catch {
+    // log file unreadable — can't confirm either way, fall through to flagging
+  }
+  console.log(clearedNearby
+    ? \`Burst at \${burst.startStr} matches a logged clear_canvas call — not flagged\`
+    : \`POSSIBLE AUTO-SYNC WIPE at \${burst.startStr}\`);
+}
 "
 ```
 
