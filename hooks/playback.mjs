@@ -20,26 +20,40 @@ function readStdin() {
   }
 }
 
-// The canvas server embeds `"scope":"tenantId/projectId"` in every
-// create/update response (src/server.ts create/update handlers), inside a
-// JSON-encoded text content block — exactly how a real MCP tool_response
-// looks. Parse that nested JSON properly rather than regexing across the
-// re-stringified payload: re-stringifying an object whose `text` field is
-// already a JSON string double-escapes its quotes, which breaks a literal
-// `"scope":` regex match against realistic payloads (found during Task 1
-// review — see ledger).
+// Tool response text is prose-wrapped, e.g.
+// "Element created successfully!\n\n{...}\n\n✅ Synced..." (src/index.ts
+// create_element/batch_create_elements handlers) — not pure JSON, so the
+// whole block.text can never be JSON.parse'd directly. Extract the first
+// balanced {...} substring before parsing (found during final review: an
+// earlier version assumed pure JSON and never matched any real response —
+// see ledger).
+//
+// Only batch_create_elements's embedded object actually carries
+// canvasStatus.scope (src/index.ts serializes the full `result`, which
+// includes it). create_element/update_element only embed the bare element
+// object with no canvasStatus at all — for those (and create_from_mermaid/
+// import_scene), this correctly returns null and the caller falls back to
+// the canvas server's active-tenant scope, which is safe in the common
+// single-tenant case (both sides read the same underlying active-tenant
+// value) but can misattribute if multiple tenants are legitimately active
+// close together. This is a known, documented limitation, not a bug to
+// silently paper over — fixing it fully would require changing what
+// src/index.ts's response text embeds, which is out of scope for this
+// plugin (it wraps the existing server; it doesn't modify it).
 function extractTenantId(payload) {
   const content = payload.tool_response?.content;
   if (!Array.isArray(content)) return null;
   for (const block of content) {
     if (block?.type !== 'text' || typeof block.text !== 'string') continue;
+    const jsonMatch = block.text.match(/\{[\s\S]*\}/);
+    if (!jsonMatch) continue;
     try {
-      const scope = JSON.parse(block.text)?.canvasStatus?.scope;
+      const scope = JSON.parse(jsonMatch[0])?.canvasStatus?.scope;
       if (typeof scope === 'string' && scope.includes('/')) {
         return scope.split('/')[0];
       }
     } catch {
-      // not JSON, or doesn't have the expected shape — try the next block
+      // not valid JSON even after extraction, or missing expected shape — try next block
     }
   }
   return null;

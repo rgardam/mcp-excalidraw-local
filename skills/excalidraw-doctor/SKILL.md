@@ -11,7 +11,7 @@ allowed-tools: Bash, AskUserQuestion
 
 # excalidraw — Doctor
 
-Run four checks and report a clear pass/fail summary.
+Run five checks and report a clear pass/fail summary.
 
 ## Step 1 — Canvas server reachable
 
