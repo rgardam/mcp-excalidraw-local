@@ -21,15 +21,28 @@ function readStdin() {
 }
 
 // The canvas server embeds `"scope":"tenantId/projectId"` in every
-// create/update response (src/server.ts create/update handlers). Pull the
-// tenant out of the tool's own response so we fetch the same scope that
-// was just drawn to, regardless of the server's separate "active tenant"
-// state (which may not match — this was a real bug found during manual
-// testing).
+// create/update response (src/server.ts create/update handlers), inside a
+// JSON-encoded text content block — exactly how a real MCP tool_response
+// looks. Parse that nested JSON properly rather than regexing across the
+// re-stringified payload: re-stringifying an object whose `text` field is
+// already a JSON string double-escapes its quotes, which breaks a literal
+// `"scope":` regex match against realistic payloads (found during Task 1
+// review — see ledger).
 function extractTenantId(payload) {
-  const text = JSON.stringify(payload.tool_response ?? '');
-  const match = text.match(/"scope":\s*"([^"/]+)\/[^"]+"/);
-  return match ? match[1] : null;
+  const content = payload.tool_response?.content;
+  if (!Array.isArray(content)) return null;
+  for (const block of content) {
+    if (block?.type !== 'text' || typeof block.text !== 'string') continue;
+    try {
+      const scope = JSON.parse(block.text)?.canvasStatus?.scope;
+      if (typeof scope === 'string' && scope.includes('/')) {
+        return scope.split('/')[0];
+      }
+    } catch {
+      // not JSON, or doesn't have the expected shape — try the next block
+    }
+  }
+  return null;
 }
 
 function bboxOf(el) {
