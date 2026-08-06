@@ -107,6 +107,15 @@ async function main() {
   const arrows = elements.filter((el) => el.type === 'arrow');
   const unlabeledArrows = arrows.filter((a) => !a.label?.text && !a.text);
 
+  // Arrow-bound pairs get the stricter MIN_ARROW_GAP threshold (connected
+  // shapes per the design guide); everything else uses MIN_SHAPE_GAP.
+  const connectedPairs = new Set();
+  for (const arrow of arrows) {
+    const from = arrow.startBinding?.elementId;
+    const to = arrow.endBinding?.elementId;
+    if (from && to) connectedPairs.add([from, to].sort().join('|'));
+  }
+
   const shapes = elements.filter((el) => el.width || el.height);
   const overlaps = [];
   const tightGaps = [];
@@ -115,10 +124,13 @@ async function main() {
       const a = shapes[i];
       const b = shapes[j];
       const gap = bboxGap(bboxOf(a), bboxOf(b));
+      const isConnected = connectedPairs.has([a.id, b.id].sort().join('|'));
+      const minGap = isConnected ? MIN_ARROW_GAP : MIN_SHAPE_GAP;
       if (gap < 0) {
         overlaps.push(`${a.id} (${a.type}) overlaps ${b.id} (${b.type}) by ~${Math.round(-gap)}px`);
-      } else if (gap < MIN_SHAPE_GAP) {
-        tightGaps.push(`${a.id} and ${b.id} are only ${Math.round(gap)}px apart (guide minimum: ${MIN_SHAPE_GAP}px)`);
+      } else if (gap < minGap) {
+        const reason = isConnected ? `connected shapes, guide minimum: ${MIN_ARROW_GAP}px` : `guide minimum: ${MIN_SHAPE_GAP}px`;
+        tightGaps.push(`${a.id} and ${b.id} are only ${Math.round(gap)}px apart (${reason})`);
       }
     }
   }
