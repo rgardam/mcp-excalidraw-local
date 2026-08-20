@@ -1,0 +1,15 @@
+{
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "mcp__excalidraw__(create_element|update_element|batch_create_elements|create_from_mermaid|import_scene)",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node ${CLAUDE_PLUGIN_ROOT}/hooks/playback.mjs"
+          }
+        ]
+      }
+    ]
+  }
+}

@@ -9,6 +9,7 @@ RUN apt-get update && apt-get install -y python3 make g++ && rm -rf /var/lib/apt
 WORKDIR /app
 
 COPY package*.json ./
+# Install all dependencies and build native modules (including better-sqlite3)
 RUN --mount=type=cache,target=/root/.npm npm ci
 
 COPY src ./src
@@ -18,26 +19,25 @@ RUN npm run build:server
 # Stage 2: Production MCP Server
 FROM node:20-slim AS production
 
-RUN apt-get update && apt-get install -y python3 make g++ && rm -rf /var/lib/apt/lists/*
-
 RUN addgroup --system --gid 1001 nodejs && \
     adduser --system --uid 1001 --gid 1001 nodejs
 
 WORKDIR /app
 
 COPY package*.json ./
-RUN --mount=type=cache,target=/root/.npm npm ci --omit=dev
+# Install production dependencies without scripts first
+RUN npm ci --omit=dev --ignore-scripts
 
-# Remove build tools after native modules are compiled
-RUN apt-get purge -y python3 make g++ && apt-get autoremove -y
-
+# Copy compiled TypeScript and built native modules from builder
 COPY --from=builder /app/dist ./dist
+# Copy only the native modules that were compiled with proper build tools
+COPY --from=builder /app/node_modules/better-sqlite3 ./node_modules/better-sqlite3
 
 RUN mkdir -p /app/data && chown -R nodejs:nodejs /app
 USER nodejs
 
 ENV NODE_ENV=production
-ENV EXPRESS_SERVER_URL=http://localhost:3000
+ENV EXPRESS_SERVER_URL=http://canvas:3000
 ENV ENABLE_CANVAS_SYNC=true
 ENV EXCALIDRAW_DB_PATH=/app/data/excalidraw.db
 

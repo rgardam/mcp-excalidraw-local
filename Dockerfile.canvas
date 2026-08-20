@@ -30,21 +30,20 @@ RUN npm run build:server
 # Stage 3: Production Canvas Server
 FROM node:20-slim AS production
 
-RUN apt-get update && apt-get install -y python3 make g++ && rm -rf /var/lib/apt/lists/*
-
 RUN addgroup --system --gid 1001 nodejs && \
     adduser --system --uid 1001 --gid 1001 nodejs
 
 WORKDIR /app
 
 COPY package*.json ./
-RUN --mount=type=cache,target=/root/.npm npm ci --omit=dev
+# Install production dependencies without scripts first
+RUN npm ci --omit=dev --ignore-scripts
 
-# Remove build tools after native modules are compiled
-RUN apt-get purge -y python3 make g++ && apt-get autoremove -y
-
+# Copy compiled TypeScript and frontend assets
 COPY --from=backend-builder /app/dist ./dist
 COPY --from=frontend-builder /app/dist/frontend ./dist/frontend
+# Copy only the native modules that were compiled with proper build tools
+COPY --from=backend-builder /app/node_modules/better-sqlite3 ./node_modules/better-sqlite3
 
 RUN mkdir -p /app/data && chown -R nodejs:nodejs /app
 USER nodejs
