@@ -8,7 +8,7 @@ A fully local, self-hosted Excalidraw MCP server with **SQLite persistence**, **
 
 Run a live Excalidraw canvas and control it from any AI agent. This repo provides:
 
-- **MCP Server**: 32 tools over stdio — works with any MCP-compatible client
+- **MCP Server**: 34 tools over stdio — works with any MCP-compatible client
 - **Agent Skill**: Portable skill with workflow playbooks, cheatsheets, and helper scripts
 - **Live Canvas**: Real-time Excalidraw UI synced via WebSocket
 - **SQLite Persistence**: Elements survive restarts, with versioning and search
