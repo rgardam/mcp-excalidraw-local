@@ -528,7 +528,19 @@ function App(): JSX.Element {
 
         case 'element_deleted':
           if (data.elementId) {
-            const filteredElements = currentElements.filter(el => el.id !== data.elementId)
+            // Also remove bound text children (labels) — otherwise they're orphaned
+            // in the scene and the next auto-sync re-persists them to the backend
+            // as standalone elements, since normalizeForBackend can no longer find
+            // their (now-deleted) container to merge them back into.
+            const oldDeleted = currentElements.find(el => el.id === data.elementId)
+            const boundDeletedIds = new Set<string>(
+              oldDeleted ? ((oldDeleted as any).boundElements || [])
+                .filter((b: any) => b.type === 'text')
+                .map((b: any) => b.id as string) : []
+            )
+            const filteredElements = currentElements.filter(el =>
+              el.id !== data.elementId && !boundDeletedIds.has(el.id)
+            )
             api.updateScene({
               elements: filteredElements,
               captureUpdate: CaptureUpdateAction.NEVER
@@ -835,7 +847,7 @@ function App(): JSX.Element {
         case 'hello_ack':
           console.log('Hello acknowledged by server:', data.tenantId, data.projectId)
           if (data.elements && Array.isArray(data.elements) && data.elements.length > 0) {
-            const converted = convertToExcalidrawElements(data.elements)
+            const converted = convertToExcalidrawElements(data.elements, { regenerateIds: false })
             api.updateScene({
               elements: converted,
               captureUpdate: CaptureUpdateAction.NEVER
@@ -889,6 +901,13 @@ function App(): JSX.Element {
     const result: ServerElement[] = []
     for (const el of elements) {
       if (boundTextIds.has(el.id)) continue // skip bound text — merged into container
+
+      // A text element with a containerId that doesn't resolve to any current
+      // element is orphaned (its container was deleted elsewhere without also
+      // cleaning up this label). Drop it rather than persisting it to the
+      // backend as a bogus standalone element.
+      const orphanContainerId = (el as any).containerId
+      if (el.type === 'text' && orphanContainerId && !elementMap.has(orphanContainerId)) continue
 
       const out: any = { ...el }
 
