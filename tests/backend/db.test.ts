@@ -384,6 +384,38 @@ describe('Projects', () => {
     const projId = getDefaultProjectForTenant('orphan');
     expect(projId).toBe('orphan-default');
   });
+
+  it('the same custom element id can be reused across different projects', () => {
+    const proj1 = createProject('Reuse-P1');
+    const proj2 = createProject('Reuse-P2');
+
+    setActiveProject(proj1.id);
+    expect(() => setElement('title', makeElement({ id: 'title', text: 'Diagram A' }))).not.toThrow();
+
+    setActiveProject(proj2.id);
+    expect(() => setElement('title', makeElement({ id: 'title', text: 'Diagram B' }))).not.toThrow();
+
+    setActiveProject(proj1.id);
+    expect(getElement('title')!.text).toBe('Diagram A');
+
+    setActiveProject(proj2.id);
+    expect(getElement('title')!.text).toBe('Diagram B');
+  });
+
+  it('deleting an element does not remove the FTS entry for the same id in another project', () => {
+    const proj1 = createProject('FTS-P1');
+    const proj2 = createProject('FTS-P2');
+
+    setActiveProject(proj1.id);
+    setElement('dup', makeElement({ id: 'dup', text: 'FindMeInP1' }));
+
+    setActiveProject(proj2.id);
+    setElement('dup', makeElement({ id: 'dup', text: 'FindMeInP2' }));
+    deleteElement('dup');
+
+    setActiveProject(proj1.id);
+    expect(searchElements('FindMeInP1').length).toBe(1);
+  });
 });
 
 // ─── Settings ────────────────────────────────────────────────

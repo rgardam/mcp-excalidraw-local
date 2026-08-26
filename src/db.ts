@@ -197,6 +197,73 @@ function runMigrations(): void {
     db.prepare('UPDATE projects SET tenant_id = ? WHERE tenant_id IS NULL').run(DEFAULT_TENANT_ID);
     logger.info(`Migrated: assigned ${orphans.length} orphan projects to default tenant`);
   }
+
+  // Migration: elements PK must be composite (id, project_id), not a bare id PK.
+  // Element ids are user/LLM-supplied (e.g. "title", "box-a") and only meaningful
+  // within a single project, but a global PK on `id` alone causes cross-project/
+  // cross-tenant UNIQUE constraint failures whenever two projects happen to reuse
+  // the same id.
+  const elementsColInfo = db.prepare("PRAGMA table_info(elements)").all() as { name: string; pk: number }[];
+  const idCol = elementsColInfo.find(c => c.name === 'id');
+  const projectIdCol = elementsColInfo.find(c => c.name === 'project_id');
+  const needsCompositeElementsPk = !!idCol && idCol.pk === 1 && (!projectIdCol || projectIdCol.pk === 0);
+  if (needsCompositeElementsPk) {
+    logger.info('Migrating elements table to composite primary key (id, project_id)...');
+    const migrateElementsPk = db.transaction(() => {
+      db.exec(`
+        CREATE TABLE elements_new (
+          id            TEXT NOT NULL,
+          project_id    TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+          type          TEXT NOT NULL,
+          data          TEXT NOT NULL,
+          label_text    TEXT,
+          created_at    TEXT NOT NULL,
+          updated_at    TEXT NOT NULL,
+          version       INTEGER NOT NULL DEFAULT 1,
+          is_deleted    INTEGER NOT NULL DEFAULT 0,
+          sync_version  INTEGER NOT NULL DEFAULT 0,
+          PRIMARY KEY (id, project_id)
+        );
+        INSERT INTO elements_new (id, project_id, type, data, label_text, created_at, updated_at, version, is_deleted, sync_version)
+          SELECT id, project_id, type, data, label_text, created_at, updated_at, version, is_deleted, sync_version FROM elements;
+        DROP TABLE elements;
+        ALTER TABLE elements_new RENAME TO elements;
+        CREATE INDEX IF NOT EXISTS idx_elements_project ON elements(project_id);
+        CREATE INDEX IF NOT EXISTS idx_elements_type ON elements(project_id, type);
+        CREATE INDEX IF NOT EXISTS idx_elements_deleted ON elements(project_id, is_deleted);
+        CREATE INDEX IF NOT EXISTS idx_elements_sync_version ON elements(project_id, sync_version);
+      `);
+    });
+    migrateElementsPk();
+    logger.info('Migrated: elements table now has composite primary key (id, project_id)');
+  }
+
+  // Migration: elements_fts must carry project_id so full-text delete/update
+  // operations don't bleed across projects that happen to share an element id
+  // (the same root cause as the elements PK migration above).
+  const ftsColInfo = db.prepare("PRAGMA table_info(elements_fts)").all() as { name: string }[];
+  const needsFtsProjectId = !ftsColInfo.some(c => c.name === 'project_id');
+  if (needsFtsProjectId) {
+    logger.info('Migrating elements_fts to include project_id...');
+    const migrateFts = db.transaction(() => {
+      db.exec(`
+        CREATE VIRTUAL TABLE elements_fts_new USING fts5(
+          element_id,
+          project_id,
+          label_text,
+          type
+        );
+        INSERT INTO elements_fts_new (element_id, project_id, label_text, type)
+          SELECT e.id, e.project_id, fts.label_text, fts.type
+          FROM elements_fts fts
+          JOIN elements e ON e.id = fts.element_id;
+        DROP TABLE elements_fts;
+        ALTER TABLE elements_fts_new RENAME TO elements_fts;
+      `);
+    });
+    migrateFts();
+    logger.info('Migrated: elements_fts now scoped by project_id');
+  }
 }
 
 function extractLabelText(element: ServerElement): string | null {
@@ -298,7 +365,7 @@ export function setElement(id: string, element: ServerElement, projectId?: strin
     `).run(element.type, data, labelText, now, newVersion, sv, id, p);
 
     recordVersion(id, newVersion, data, existing.is_deleted ? 'create' : 'update', p);
-    updateFts(id, labelText, element.type);
+    updateFts(id, labelText, element.type, p);
   } else {
     db.prepare(`
       INSERT INTO elements (id, project_id, type, data, label_text, created_at, updated_at, version, sync_version)
@@ -306,7 +373,7 @@ export function setElement(id: string, element: ServerElement, projectId?: strin
     `).run(id, p, element.type, data, labelText, now, now, sv);
 
     recordVersion(id, 1, data, 'create', p);
-    insertFts(id, labelText, element.type);
+    insertFts(id, labelText, element.type, p);
   }
   return sv;
 }
@@ -327,7 +394,7 @@ export function deleteElement(id: string, projectId?: string): boolean {
   `).run(newVersion, new Date().toISOString(), sv, id, p);
 
   recordVersion(id, newVersion, existing.data, 'delete', p);
-  deleteFts(id);
+  deleteFts(id, p);
   return true;
 }
 
@@ -360,7 +427,7 @@ export function clearElements(projectId?: string): number {
     const info = stmt.run(now, sv, p);
     for (const el of elements) {
       recordVersion(el.id, (el.version || 1) + 1, JSON.stringify(el), 'delete', p);
-      deleteFts(el.id);
+      deleteFts(el.id, p);
     }
     return info.changes;
   });
@@ -384,29 +451,30 @@ export function queryElements(type?: string, filter?: Record<string, any>, proje
 }
 
 export function searchElements(query: string, projectId?: string): ServerElement[] {
+  const p = pid(projectId);
   const rows = db.prepare(`
     SELECT e.data FROM elements e
-    INNER JOIN elements_fts fts ON fts.element_id = e.id
+    INNER JOIN elements_fts fts ON fts.element_id = e.id AND fts.project_id = e.project_id
     WHERE elements_fts MATCH ? AND e.project_id = ? AND e.is_deleted = 0
-  `).all(query, pid(projectId)) as { data: string }[];
+  `).all(query, p) as { data: string }[];
   return rows.map(r => JSON.parse(r.data));
 }
 
 // ── FTS helpers ──
 
-function insertFts(elementId: string, labelText: string | null, type: string): void {
-  db.prepare('INSERT INTO elements_fts (element_id, label_text, type) VALUES (?, ?, ?)').run(
-    elementId, labelText || '', type
+function insertFts(elementId: string, labelText: string | null, type: string, projectId: string): void {
+  db.prepare('INSERT INTO elements_fts (element_id, project_id, label_text, type) VALUES (?, ?, ?, ?)').run(
+    elementId, projectId, labelText || '', type
   );
 }
 
-function updateFts(elementId: string, labelText: string | null, type: string): void {
-  deleteFts(elementId);
-  insertFts(elementId, labelText, type);
+function updateFts(elementId: string, labelText: string | null, type: string, projectId: string): void {
+  deleteFts(elementId, projectId);
+  insertFts(elementId, labelText, type, projectId);
 }
 
-function deleteFts(elementId: string): void {
-  db.prepare("DELETE FROM elements_fts WHERE element_id = ?").run(elementId);
+function deleteFts(elementId: string, projectId: string): void {
+  db.prepare("DELETE FROM elements_fts WHERE element_id = ? AND project_id = ?").run(elementId, projectId);
 }
 
 // ── Version history ──
