@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import request from 'supertest';
-import { initDb, closeDb, setElement, getAllElements, setActiveTenant, getCurrentSyncVersion } from '../../src/db.js';
+import { initDb, closeDb, setElement, getAllElements, setActiveTenant, getCurrentSyncVersion, ensureTenant } from '../../src/db.js';
 import type { ServerElement } from '../../src/types.js';
 import path from 'path';
 import os from 'os';
@@ -441,6 +441,43 @@ describe('Files API comprehensive', () => {
       .send({ files: 'not-an-object' });
 
     expect(res.status).toBe(400);
+  });
+
+  it('files are isolated per project — one project cannot see or delete another\'s files', async () => {
+    ensureTenant('files-proj-a', 'Project A', '/path/a');
+    ensureTenant('files-proj-b', 'Project B', '/path/b');
+
+    await request(app)
+      .post('/api/files')
+      .set('X-Tenant-Id', 'files-proj-a')
+      .send({
+        files: { 'shared-id': { id: 'shared-id', mimeType: 'image/png', dataURL: 'data:image/png;base64,aaa', created: Date.now() } },
+      });
+
+    // Same file id reused in a different project — must not collide or leak.
+    await request(app)
+      .post('/api/files')
+      .set('X-Tenant-Id', 'files-proj-b')
+      .send({
+        files: { 'shared-id': { id: 'shared-id', mimeType: 'image/jpeg', dataURL: 'data:image/jpeg;base64,bbb', created: Date.now() } },
+      });
+
+    const listA = await request(app).get('/api/files').set('X-Tenant-Id', 'files-proj-a');
+    expect(Object.keys(listA.body.files)).toEqual(['shared-id']);
+    expect(listA.body.files['shared-id'].mimeType).toBe('image/png');
+
+    const listB = await request(app).get('/api/files').set('X-Tenant-Id', 'files-proj-b');
+    expect(Object.keys(listB.body.files)).toEqual(['shared-id']);
+    expect(listB.body.files['shared-id'].mimeType).toBe('image/jpeg');
+
+    // Project B must not be able to delete Project A's file via the shared id.
+    const badDelete = await request(app)
+      .delete('/api/files/shared-id')
+      .set('X-Tenant-Id', 'files-proj-b');
+    expect(badDelete.status).toBe(200);
+
+    const listAAfter = await request(app).get('/api/files').set('X-Tenant-Id', 'files-proj-a');
+    expect(listAAfter.body.files['shared-id']).toBeDefined();
   });
 });
 

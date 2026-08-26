@@ -381,6 +381,38 @@ describe('Tenant switch via API', () => {
     ws.close();
   });
 
+  it('does NOT redirect an already-identified client to a different tenant switched elsewhere', async () => {
+    // This is the actual bug: this canvas server is shared across every
+    // project on the machine. A tenant switch triggered by one project's MCP
+    // process (which happens automatically on every reconnect) must not hijack
+    // a browser tab that already identified with — and is actively displaying —
+    // a completely different tenant.
+    ensureTenant('my-own-project', 'My Own Project', '/path/my-own-project');
+    ensureTenant('someone-elses-project', 'Someone Elses Project', '/path/elsewhere');
+
+    const ws = await connectClient();
+    await sendHelloAndWait(ws, 'my-own-project');
+
+    let sawTenantSwitched = false;
+    const handler = (data: WebSocket.RawData) => {
+      const msg = JSON.parse(data.toString());
+      if (msg.type === 'tenant_switched') sawTenantSwitched = true;
+    };
+    ws.on('message', handler);
+
+    await request(app)
+      .put('/api/tenant/active')
+      .send({ tenantId: 'someone-elses-project' });
+
+    // Give any (incorrect) broadcast time to arrive before asserting it didn't.
+    await new Promise((r) => setTimeout(r, 300));
+    ws.off('message', handler);
+
+    expect(sawTenantSwitched).toBe(false);
+
+    ws.close();
+  });
+
   it('GET /api/elements after tenant switch returns new tenant elements', async () => {
     ensureTenant('ctx-old', 'Old', '/path/old');
     ensureTenant('ctx-new', 'New', '/path/new');

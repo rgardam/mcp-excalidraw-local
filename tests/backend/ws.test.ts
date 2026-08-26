@@ -10,6 +10,8 @@ let dbPath: string;
 let port: number;
 let startCanvasServer: () => Promise<void>;
 let stopCanvasServer: () => Promise<void>;
+let heartbeatTick: () => void;
+let wsToConnection: Map<WebSocket, { isAlive: boolean }>;
 
 /**
  * Connect a WS client and immediately start buffering all messages.
@@ -80,6 +82,8 @@ beforeAll(async () => {
   const mod = await import('../../src/server.js');
   startCanvasServer = mod.startCanvasServer;
   stopCanvasServer = mod.stopCanvasServer;
+  heartbeatTick = mod.heartbeatTick;
+  wsToConnection = mod.wsToConnection;
   await startCanvasServer();
 });
 
@@ -447,6 +451,109 @@ describe('sync_version in broadcasts', () => {
     expect(msg).toHaveProperty('sync_version');
     expect(typeof msg.sync_version).toBe('number');
     expect(msg.sync_version).toBeGreaterThan(0);
+
+    ws.close();
+  });
+});
+
+describe('Viewport / export scope guard', () => {
+  // A globally-nonzero connection count doesn't mean a browser is connected to
+  // the *specific* tenant/project scope a request targets (e.g. another Claude
+  // Code session's browser tab connected to a different tenant). Both endpoints
+  // must fail fast using the scoped delivery count instead of waiting out their
+  // full timeout (10s / 30s) when nobody is listening in scope.
+
+  it('POST /api/viewport returns 503 immediately when no browser is connected in scope', async () => {
+    const start = Date.now();
+    const res = await fetch(`http://localhost:${port}/api/viewport`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Tenant-Id': 'viewport-test-tenant-empty' },
+      body: JSON.stringify({ scrollToContent: true }),
+    });
+    const elapsed = Date.now() - start;
+
+    expect(res.status).toBe(503);
+    expect(elapsed).toBeLessThan(2000);
+    const body = await res.json();
+    expect(body.success).toBe(false);
+  });
+
+  it('POST /api/export/image returns 503 immediately when no browser is connected in scope', async () => {
+    const start = Date.now();
+    const res = await fetch(`http://localhost:${port}/api/export/image`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Tenant-Id': 'export-test-tenant-empty' },
+      body: JSON.stringify({ format: 'png' }),
+    });
+    const elapsed = Date.now() - start;
+
+    expect(res.status).toBe(503);
+    expect(elapsed).toBeLessThan(2000);
+    const body = await res.json();
+    expect(body.success).toBe(false);
+  });
+
+  it('POST /api/viewport still resolves normally when a browser is connected in scope', async () => {
+    const ws = await connectClient();
+    await drainInitialMessages(ws);
+
+    const resultPromise = fetch(`http://localhost:${port}/api/viewport`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ scrollToContent: true }),
+    });
+
+    const viewportMsg = await waitForMessageOfType(ws, 'set_viewport');
+    ws.send(JSON.stringify({ type: 'ack', msgId: viewportMsg.msgId }));
+    await fetch(`http://localhost:${port}/api/viewport/result`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ requestId: viewportMsg.requestId, success: true, message: 'Viewport updated' }),
+    });
+
+    const res = await resultPromise;
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.success).toBe(true);
+
+    ws.close();
+  });
+});
+
+describe('Heartbeat', () => {
+  // A socket that disconnects without a clean close handshake (abrupt page
+  // navigation, crashed tab) can linger in the connection registry with
+  // readyState still OPEN, inflating broadcastToScope's delivered count.
+  // heartbeatTick() is the sweep that prunes those; we drive it directly
+  // rather than waiting out the real 30s interval.
+
+  it('terminates connections that did not respond since the last tick', async () => {
+    const ws = await connectClient();
+    await drainInitialMessages(ws);
+
+    expect(wsToConnection.size).toBeGreaterThan(0);
+    for (const conn of wsToConnection.values()) conn.isAlive = false;
+
+    heartbeatTick();
+    await new Promise((r) => setTimeout(r, 300));
+
+    expect(wsToConnection.size).toBe(0);
+  });
+
+  it('pings alive connections without terminating them', async () => {
+    const ws = await connectClient();
+    await drainInitialMessages(ws);
+
+    const sizeBefore = wsToConnection.size;
+    expect(sizeBefore).toBeGreaterThan(0);
+    for (const conn of wsToConnection.values()) conn.isAlive = true;
+
+    heartbeatTick();
+    await new Promise((r) => setTimeout(r, 300));
+
+    // Still registered (not terminated) — and heartbeatTick's ping() flips
+    // isAlive back to false until the client's automatic pong response lands.
+    expect(wsToConnection.size).toBe(sizeBefore);
 
     ws.close();
   });

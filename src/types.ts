@@ -205,6 +205,7 @@ export interface ClientConnection {
   projectId: string;
   connectedAt: number;
   identified: boolean;  // true after hello handshake
+  isAlive: boolean;     // heartbeat liveness flag — see wss.on('connection') in server.ts
 }
 
 export interface BroadcastResult {
@@ -345,10 +346,20 @@ export interface ExcalidrawFile {
   dataURL: string;
   created: number;
   lastRetrieved?: number;
+  projectId: string;
 }
 
-// In-memory file storage (image files are too large for SQLite row storage)
+// In-memory file storage (image files are too large for SQLite row storage).
+// Keyed by "<projectId>:<id>", not just id — this map is shared across every
+// tenant/project on the canvas server, and file ids are client-generated with
+// no cross-project uniqueness guarantee (the same root cause as the
+// elements.id collision bug). A bare `id` key let two projects reusing the
+// same file id silently overwrite each other's stored file.
 export const files = new Map<string, ExcalidrawFile>();
+
+export function fileKey(projectId: string, id: string): string {
+  return `${projectId}:${id}`;
+}
 
 // ── Font families — single source of truth ──────────────────────────────
 // IDs match the @excalidraw/excalidraw FONT_FAMILY constant.

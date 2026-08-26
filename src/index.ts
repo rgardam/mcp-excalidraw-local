@@ -27,7 +27,6 @@ import {
   ExcalidrawElementType,
   validateElement,
   normalizeFontFamily,
-  files as globalFiles,
   DEFAULT_FONT_FAMILY,
   FONT_FAMILY_DESCRIPTION,
 } from './types.js';
@@ -1808,11 +1807,20 @@ server.setRequestHandler(CallToolRequestSchema, async (request: CallToolRequest)
         const data = await response.json() as ApiResponse;
         const sceneElements = data.elements || [];
 
-        // Collect files from the in-memory store
+        // Collect this project's files via the canvas server's scoped endpoint
+        // rather than reading the shared in-memory store directly — that store
+        // holds every project's files, and exporting from it unfiltered would
+        // leak other projects' images into this export.
         const exportFiles: Record<string, any> = {};
-        for (const [id, file] of globalFiles) {
-          exportFiles[id] = file;
-        }
+        try {
+          const filesResponse = await fetch(`${EXPRESS_SERVER_URL}/api/files`, {
+            headers: canvasHeaders()
+          });
+          if (filesResponse.ok) {
+            const filesData = await filesResponse.json() as { files?: Record<string, any> };
+            Object.assign(exportFiles, filesData.files || {});
+          }
+        } catch {}
 
         const excalidrawScene = {
           type: 'excalidraw',
@@ -1876,19 +1884,11 @@ server.setRequestHandler(CallToolRequestSchema, async (request: CallToolRequest)
           throw new Error('No elements found in the import data');
         }
 
-        // Import files if present
+        // Import files if present — push to the canvas server, which owns
+        // the (project-scoped) files map; writing to it directly here would
+        // need to duplicate that scoping logic.
         const importedFiles = sceneData.files;
         if (importedFiles && typeof importedFiles === 'object') {
-          for (const [id, fileData] of Object.entries(importedFiles)) {
-            const file = fileData as any;
-            globalFiles.set(id, {
-              id,
-              mimeType: file.mimeType || 'image/png',
-              dataURL: file.dataURL,
-              created: file.created || Date.now(),
-            });
-          }
-          // Push files to canvas server
           try {
             await fetch(`${EXPRESS_SERVER_URL}/api/files`, {
               method: 'POST',

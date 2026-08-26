@@ -23,6 +23,7 @@ import {
   normalizeFontFamily,
   ExcalidrawFile,
   files,
+  fileKey,
   ClientConnection,
   BroadcastResult
 } from './types.js';
@@ -40,6 +41,40 @@ const __dirname = path.dirname(__filename);
 const app: Application = express();
 const httpServer = createServer(app);
 const wss = new WebSocketServer({ server: httpServer });
+
+// Heartbeat: without this, a socket that disconnects without a clean close
+// handshake (e.g. an abrupt page navigation) lingers in the connection registry
+// indefinitely with readyState still OPEN. That inflates broadcastToScope's
+// delivered/connectedBrowsers counts and lets stale sockets sit in scope
+// alongside real clients. Standard ws heartbeat pattern: ping every 30s,
+// terminate anyone who didn't pong since the last check.
+const HEARTBEAT_INTERVAL_MS = 30000;
+let heartbeatInterval: ReturnType<typeof setInterval> | null = null;
+
+// Extracted so tests can drive one sweep synchronously instead of waiting out
+// the real interval.
+export function heartbeatTick(): void {
+  for (const conn of wsToConnection.values()) {
+    if (!conn.isAlive) {
+      conn.ws.terminate();
+      continue;
+    }
+    conn.isAlive = false;
+    conn.ws.ping();
+  }
+}
+
+function startHeartbeat(): void {
+  if (heartbeatInterval) return;
+  heartbeatInterval = setInterval(heartbeatTick, HEARTBEAT_INTERVAL_MS);
+}
+
+function stopHeartbeat(): void {
+  if (heartbeatInterval) {
+    clearInterval(heartbeatInterval);
+    heartbeatInterval = null;
+  }
+}
 
 // Middleware
 app.use(cors());
@@ -80,7 +115,7 @@ function resolveScope(req: Request): { tenantId: string; projectId: string } {
 // Scoped by tenant → project → Set<ClientConnection>
 const connections = new Map<string, Map<string, Set<ClientConnection>>>();
 // Reverse lookup: ws → ClientConnection (for fast cleanup)
-const wsToConnection = new Map<WebSocket, ClientConnection>();
+export const wsToConnection = new Map<WebSocket, ClientConnection>();
 
 function registerConnection(conn: ClientConnection): void {
   let tenantMap = connections.get(conn.tenantId);
@@ -114,7 +149,7 @@ function unregisterConnection(ws: WebSocket): void {
 
 function moveConnection(ws: WebSocket, newTenantId: string, newProjectId: string): void {
   unregisterConnection(ws);
-  const conn = { ws, tenantId: newTenantId, projectId: newProjectId, connectedAt: Date.now(), identified: true };
+  const conn = { ws, tenantId: newTenantId, projectId: newProjectId, connectedAt: Date.now(), identified: true, isAlive: true };
   registerConnection(conn);
 }
 
@@ -238,12 +273,18 @@ async function serializedBroadcastWithAck(
   }
 }
 
-// Legacy broadcast: sends to ALL connected clients (used for global messages
-// like tenant_switched that aren't scoped to a single project).
-function broadcast(message: WebSocketMessage): void {
+// tenant_switched must NOT reach already-identified connections: this canvas
+// server is shared across every project on the machine, and each project's
+// MCP process pushes its own auto-detected tenant as "active" on every
+// reconnect (observed happening roughly every 5 minutes). A plain broadcast()
+// here was hijacking every open browser tab across every OTHER project onto
+// whichever tenant most recently connected, regardless of what tenant that
+// tab had deliberately chosen. Only unidentified connections (fresh page
+// loads still waiting for their first hello) need this bootstrapping hint.
+function broadcastToUnidentified(message: WebSocketMessage): void {
   const data = JSON.stringify(message);
   for (const conn of wsToConnection.values()) {
-    if (conn.ws.readyState === WebSocket.OPEN) {
+    if (!conn.identified && conn.ws.readyState === WebSocket.OPEN) {
       conn.ws.send(data);
     }
   }
@@ -259,10 +300,19 @@ wss.on('connection', (ws: WebSocket) => {
     tenantId: tenant.id,
     projectId: fallbackProjectId,
     connectedAt: Date.now(),
-    identified: false
+    identified: false,
+    isAlive: true
   };
   registerConnection(conn);
   logger.info('New WebSocket connection established (awaiting hello)');
+
+  // Look up the current registration on each pong rather than closing over `conn`
+  // directly — moveConnection() (on the 'hello' handshake) swaps in a new object
+  // for this socket, and a stale closure would keep marking the wrong one alive.
+  ws.on('pong', () => {
+    const current = wsToConnection.get(ws);
+    if (current) current.isAlive = true;
+  });
 
   // Send tenant info so the FE knows where to send hello
   ws.send(JSON.stringify({
@@ -278,14 +328,6 @@ wss.on('connection', (ws: WebSocket) => {
   };
   ws.send(JSON.stringify(initialMessage));
 
-  // Send any stored files (image data)
-  if (files.size > 0) {
-    const allFiles: Record<string, ExcalidrawFile> = {};
-    for (const [id, file] of files) {
-      allFiles[id] = file;
-    }
-    ws.send(JSON.stringify({ type: 'files_added', files: allFiles }));
-  }
 
   // Send sync status to new client
   const syncMessage: SyncStatusMessage = {
@@ -315,6 +357,23 @@ wss.on('connection', (ws: WebSocket) => {
             projectId: helloProjectId,
             elements
           }));
+
+          // Send this project's files (images) only — files were previously
+          // sent once at raw connection time using whatever tenant happened
+          // to be globally "active", unscoped from what this client actually
+          // identifies as here. That leaked every project's images to every
+          // browser and could hand a client the wrong project's files entirely.
+          const projectFiles: Record<string, ExcalidrawFile> = {};
+          let hasProjectFiles = false;
+          for (const file of files.values()) {
+            if (file.projectId === helloProjectId) {
+              projectFiles[file.id] = file;
+              hasProjectFiles = true;
+            }
+          }
+          if (hasProjectFiles) {
+            ws.send(JSON.stringify({ type: 'files_added', files: projectFiles }));
+          }
         }
       }
       if (msg.type === 'ack' && msg.msgId) {
@@ -1069,12 +1128,13 @@ app.get('/api/sync/version', (req: Request, res: Response) => {
 
 // ── Files API (image element data) ──
 
-// Get all files
-app.get('/api/files', (_req: Request, res: Response) => {
+// Get all files for the caller's project
+app.get('/api/files', (req: Request, res: Response) => {
   try {
+    const scope = resolveScope(req);
     const allFiles: Record<string, ExcalidrawFile> = {};
-    for (const [id, file] of files) {
-      allFiles[id] = file;
+    for (const file of files.values()) {
+      if (file.projectId === scope.projectId) allFiles[file.id] = file;
     }
     res.json({ success: true, files: allFiles });
   } catch (error) {
@@ -1086,26 +1146,31 @@ app.get('/api/files', (_req: Request, res: Response) => {
 // Add files (image data)
 app.post('/api/files', (req: Request, res: Response) => {
   try {
+    const scope = resolveScope(req);
     const incoming = req.body.files;
     if (!incoming || typeof incoming !== 'object') {
       return res.status(400).json({ success: false, error: 'files object is required' });
     }
 
     const addedIds: string[] = [];
+    const addedFiles: Record<string, ExcalidrawFile> = {};
     for (const [id, fileData] of Object.entries(incoming)) {
       const file = fileData as ExcalidrawFile;
-      files.set(id, {
+      const stored: ExcalidrawFile = {
         id,
         mimeType: file.mimeType || 'image/png',
         dataURL: file.dataURL,
         created: file.created || Date.now(),
-      });
+        projectId: scope.projectId,
+      };
+      files.set(fileKey(scope.projectId, id), stored);
+      addedFiles[id] = stored;
       addedIds.push(id);
     }
 
-    broadcast({
+    broadcastToScope(scope.tenantId, scope.projectId, {
       type: 'files_added',
-      files: incoming
+      files: addedFiles
     });
 
     res.json({ success: true, addedIds, count: addedIds.length });
@@ -1115,15 +1180,18 @@ app.post('/api/files', (req: Request, res: Response) => {
   }
 });
 
-// Delete a file
+// Delete a file (only if it belongs to the caller's project)
 app.delete('/api/files/:id', (req: Request, res: Response) => {
   try {
+    const scope = resolveScope(req);
     const { id } = req.params;
-    if (!files.has(id!)) {
+    const key = fileKey(scope.projectId, id!);
+    const existing = files.get(key);
+    if (!existing) {
       return res.status(404).json({ success: false, error: `File ${id} not found` });
     }
-    files.delete(id!);
-    broadcast({ type: 'file_deleted', fileId: id });
+    files.delete(key);
+    broadcastToScope(scope.tenantId, scope.projectId, { type: 'file_deleted', fileId: id });
     res.json({ success: true, message: `File ${id} deleted` });
   } catch (error) {
     logger.error('Error deleting file:', error);
@@ -1150,15 +1218,25 @@ app.post('/api/export/image', (req: Request, res: Response) => {
       });
     }
 
-    if (wsToConnection.size === 0) {
-      return res.status(503).json({
-        success: false,
-        error: 'No frontend client connected. Open the canvas in a browser first.'
-      });
-    }
-
     const requestId = generateId();
     const scope = resolveScope(req);
+
+    const broadcastResult = broadcastToScope(scope.tenantId, scope.projectId, {
+      type: 'export_image_request',
+      requestId,
+      format,
+      background: background ?? true,
+      captureViewport: captureViewport ?? false
+    });
+
+    // Same reasoning as /api/viewport: a globally-nonzero connection count doesn't
+    // mean a browser is connected to *this* tenant/project scope.
+    if (broadcastResult.delivered === 0) {
+      return res.status(503).json({
+        success: false,
+        error: `No browser connected for tenant "${scope.tenantId}" / project "${scope.projectId}". Open the canvas for this workspace in a browser first.`
+      });
+    }
 
     const exportPromise = new Promise<{ format: string; data: string }>((resolve, reject) => {
       const timeout = setTimeout(() => {
@@ -1167,14 +1245,6 @@ app.post('/api/export/image', (req: Request, res: Response) => {
       }, 30000);
 
       pendingExports.set(requestId, { resolve, reject, timeout });
-    });
-
-    broadcastToScope(scope.tenantId, scope.projectId, {
-      type: 'export_image_request',
-      requestId,
-      format,
-      background: background ?? true,
-      captureViewport: captureViewport ?? false
     });
 
     exportPromise
@@ -1251,15 +1321,29 @@ app.post('/api/viewport', (req: Request, res: Response) => {
   try {
     const { scrollToContent, scrollToElementId, zoom, offsetX, offsetY } = req.body;
 
-    if (wsToConnection.size === 0) {
-      return res.status(503).json({
-        success: false,
-        error: 'No frontend client connected. Open the canvas in a browser first.'
-      });
-    }
-
     const requestId = generateId();
     const scope = resolveScope(req);
+
+    const broadcastResult = broadcastToScope(scope.tenantId, scope.projectId, {
+      type: 'set_viewport',
+      requestId,
+      scrollToContent,
+      scrollToElementId,
+      zoom,
+      offsetX,
+      offsetY
+    });
+
+    // wsToConnection.size only proves *some* browser is connected somewhere — with
+    // multiple tenants/projects sharing one canvas server, that browser may be
+    // scoped to a different workspace entirely. Check actual delivery into this
+    // scope instead, so we fail fast rather than waiting out the full timeout.
+    if (broadcastResult.delivered === 0) {
+      return res.status(503).json({
+        success: false,
+        error: `No browser connected for tenant "${scope.tenantId}" / project "${scope.projectId}". Open the canvas for this workspace in a browser first.`
+      });
+    }
 
     const viewportPromise = new Promise<{ success: boolean; message: string }>((resolve, reject) => {
       const timeout = setTimeout(() => {
@@ -1268,16 +1352,6 @@ app.post('/api/viewport', (req: Request, res: Response) => {
       }, 10000);
 
       pendingViewports.set(requestId, { resolve, reject, timeout });
-    });
-
-    broadcastToScope(scope.tenantId, scope.projectId, {
-      type: 'set_viewport',
-      requestId,
-      scrollToContent,
-      scrollToElementId,
-      zoom,
-      offsetX,
-      offsetY
     });
 
     viewportPromise
@@ -1491,7 +1565,7 @@ app.put('/api/tenant/active', (req: Request, res: Response) => {
     dbSetActiveTenant(tenantId);
     const tenant = dbGetActiveTenant();
 
-    broadcast({
+    broadcastToUnidentified({
       type: 'tenant_switched',
       tenant: { id: tenant.id, name: tenant.name, workspace_path: tenant.workspace_path }
     });
@@ -1612,6 +1686,7 @@ export async function startCanvasServer(): Promise<void> {
     });
   });
   canvasServerOwned = true;
+  startHeartbeat();
   logger.info(`Canvas server running on http://${HOST}:${PORT}`);
   logger.info(`WebSocket server running on ws://${HOST}:${PORT}`);
 }
@@ -1621,6 +1696,7 @@ export function stopCanvasServer(): Promise<void> {
     logger.info('Canvas server not owned by this process, skipping shutdown');
     return Promise.resolve();
   }
+  stopHeartbeat();
   return new Promise((resolve) => {
     for (const conn of wsToConnection.values()) conn.ws.close();
     httpServer.close(() => resolve());

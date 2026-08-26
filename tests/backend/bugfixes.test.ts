@@ -105,7 +105,7 @@ describe('Image export captureViewport parameter', () => {
 
     // 503 = no frontend connected (expected in tests), but not 400 (bad request)
     expect(res.status).toBe(503);
-    expect(res.body.error).toContain('No frontend client connected');
+    expect(res.body.error).toContain('No browser connected for tenant');
   });
 
   it('rejects invalid format even with captureViewport', async () => {
