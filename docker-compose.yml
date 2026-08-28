@@ -16,7 +16,12 @@ services:
     image: sanjibdevnath/mcp-excalidraw-local-canvas:latest
     container_name: mcp-excalidraw-canvas
     ports:
-      - "3000:3000"
+      # Host-side port only — kept off 3000 since that's a very common default
+      # for other local dev servers (create-react-app, Backstage, etc.) and a
+      # host-side collision silently shadows this container for anything that
+      # resolves "localhost" to whichever process bound it more specifically.
+      # Override with CANVAS_HOST_PORT if 3737 is also taken.
+      - "${CANVAS_HOST_PORT:-3737}:3000"
     environment:
       - NODE_ENV=production
       - PORT=3000

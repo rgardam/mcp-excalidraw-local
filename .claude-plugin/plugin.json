@@ -8,7 +8,11 @@
   "mcpServers": {
     "excalidraw": {
       "command": "node",
-      "args": ["${CLAUDE_PLUGIN_ROOT}/dist/index.js"]
+      "args": ["${CLAUDE_PLUGIN_ROOT}/dist/index.js"],
+      "env": {
+        "CANVAS_PORT": "3737",
+        "EXPRESS_SERVER_URL": "http://localhost:3737"
+      }
     }
   }
 }
